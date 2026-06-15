@@ -68,6 +68,65 @@ The 32 MB React client bundle is embedded (compressed) inside the Tauri binary a
 
 ---
 
+## JS Codebase & Tooling Impact
+
+This is the consideration most underrepresented in the bundle-size narrative: **the entire main-process JavaScript codebase — ~7,150 lines of code and ~10,000 lines of tests — does not migrate. It must be rewritten in Rust.**
+
+### What gets replaced
+
+The React client (`client/`) is untouched. Everything else — `app/lib/` — is discarded:
+
+| Subsystem | Lines | Test lines | Notes |
+|-----------|-------|------------|-------|
+| `zeebe-api/` | 1,659 | 4,918 | Dual gRPC/REST, cert extraction, error mapping |
+| `file-context/` | 1,394 | 752 | chokidar watcher, BPMN/DMN/Form XML indexing |
+| `menu/` | 1,197 | 546 | ~30 dynamic menu items, platform-specific |
+| `index.js` (main) | 944 | — | App lifecycle, IPC routing, session management |
+| `config/` + `util/` + others | ~2,050 | ~3,800 | Mostly portable logic, but still a rewrite |
+| **Total** | **~7,150** | **~10,000** | |
+
+The test suite — 22 files, ~10,000 lines of Mocha/Sinon — cannot be carried forward. All of it must be rewritten.
+
+### The three hardest subsystems
+
+**`zeebe-api/`**: The most tested code in the repo (4,918 test lines). It dynamically switches between gRPC and REST, extracts TLS certificates per platform (Windows via Crypt32 DLL, macOS via `security` CLI, Linux via filesystem paths), and maps low-level error codes to user-facing messages. No official Rust port of `@camunda8/sdk` exists. REST-only mode removes the gRPC complexity, but the cert extraction, error mapping, and response transformation still need full Rust implementations.
+
+**`file-context/`**: 1,394 lines of battle-hardened file watching (chokidar) combined with streaming XML parsing (saxen + bpmn-moddle/dmn-moddle). It maintains a live in-memory index of every BPMN/DMN/Form/RPA file in watched roots, with debounced atomic-operation handling and concurrent work queues. The Rust `notify` crate can replace chokidar, but the BPMN/DMN semantic extraction (process IDs, signal definitions, user task types, form keys) has no ready-made Rust equivalent and would be a ground-up implementation.
+
+**`menu/`**: ~30 native menu items rebuilt on every state change (active tab, unsaved changes, dev mode, plugins). macOS-specific conventions (app menu, Services submenu, Preferences placement) are non-trivial to replicate with Tauri's menu API.
+
+### Tooling that disappears entirely
+
+| Tool | Role | Rust replacement |
+|------|------|-----------------|
+| Mocha / Chai / Sinon | Test runner, assertions, mocking | `cargo test` + `mockall` (harder) |
+| nyc / Istanbul | Coverage reporting | `cargo-llvm-cov` |
+| proxyquire | Module-level mocking in tests | No direct equivalent |
+| ESLint (bpmn-io plugin) | Main-process linting | `cargo clippy` |
+| webpack (preload bundle) | Preload bundling | Eliminated |
+
+The gap between Sinon's module-level stubs and Rust mocking is non-trivial. Rust requires traits + dependency injection to make code testable; the existing JS code structure would need to be redesigned in Rust to achieve comparable test isolation.
+
+### Developer experience change
+
+- Main-process work moves from JavaScript to Rust. The team needs to acquire or hire Rust proficiency.
+- The repo becomes genuinely polyglot: Rust for the app shell, JavaScript/React for the client. Every piece of functionality that crosses the IPC boundary requires changes in both languages.
+- Compile-test loops are slower: Rust incremental builds take seconds to minutes vs. Node.js instant module reloads.
+- Debugging tools differ: Chrome DevTools still covers the renderer; gdb/lldb or `tokio-console` replaces Node.js Inspector for the app layer.
+
+### Rewrite effort estimate
+
+| Scenario | Estimate |
+|----------|---------|
+| Experienced Rust developer, full feature parity | 6–10 weeks |
+| Team learning Rust while migrating | 16–24 weeks |
+| Code to rewrite (JS → Rust, estimated) | ~7,150 lines JS → ~4,000–5,000 lines Rust |
+| Tests to rewrite | ~10,000 lines Mocha → ~5,000 lines Rust |
+
+The Rust shell in this experiment is ~500 lines covering happy-path IPC. The production rewrite must match the edge-case handling and test coverage of the existing JavaScript — that is the real cost.
+
+---
+
 ## Distribution & Runtime Risk (New Considerations)
 
 This is the fundamental trade-off of Tauri vs. Electron. **Electron is self-contained; Tauri is not.** The OS-managed webview is what makes the bundle small, but it also means customers must have the right runtime installed.
@@ -135,13 +194,17 @@ depends on OS and version:
 
 | Blocker | Severity | Suggested Path |
 |---------|----------|----------------|
+| ~7,150 lines JS main-process rewrite in Rust | **High** | Incremental migration per subsystem |
+| ~10,000 lines of tests to rewrite | **High** | Rewrite alongside code; accept lower coverage initially |
 | System webview distribution risk | **High** | deb/rpm primary format; startup dependency check; WebView2 bootstrapper on Windows |
-| Zeebe gRPC API | High | Switch to REST API (Camunda 8.6+) |
-| Cross-platform rendering (WebKit vs Chromium) | High | Dedicated QA pass; test BPMN/DMN SVG on WebKit |
+| Zeebe gRPC API + cert extraction | **High** | Switch to REST API (Camunda 8.6+); port cert extraction to Rust |
+| Cross-platform rendering (WebKit vs Chromium) | **High** | Dedicated QA pass; test BPMN/DMN SVG on WebKit |
+| file-context watcher + BPMN/DMN indexer | **High** | Rewrite with `notify` crate + custom XML parser |
+| Developer Rust proficiency | **High** | Training or hiring; affects every future main-process change |
 | Plugin loading | Medium | CSS/HTML-only plugins in sandboxed iframe |
 | App auto-update | Medium | `tauri-plugin-updater` + manifest migration |
 | Air-gapped installation guidance | Medium | Document offline dependency pre-staging |
-| Dynamic native menus | Low | Implement via Tauri `Menu` API |
+| Dynamic native menus | Medium | Implement via Tauri `Menu` API; macOS conventions |
 | Code signing | Low | Tauri native signing config |
 | Windows cert store | Low | `rustls-native-certs` crate |
 
@@ -149,19 +212,25 @@ depends on OS and version:
 
 ## Recommendation
 
-A full Tauri migration is feasible and the 7× bundle size reduction is a real, meaningful win. However, the distribution risk means it cannot be treated as a drop-in replacement — it requires a deliberate rollout strategy.
+The 7× bundle size reduction is real and meaningful. The migration is technically feasible — this experiment proves the IPC bridge, the build pipeline, and the bundle size claim. However, the full picture is significantly more demanding than the bundle size number suggests:
+
+- The ~7,150-line JavaScript main-process and its ~10,000-line test suite must be fully rewritten in Rust. This is not a tweak — it is replacing the entire app layer.
+- The dev team needs Rust proficiency for all future main-process work. That is a long-term capability investment, not just an upfront cost.
+- Distribution now depends on OS-managed runtimes, introducing a new support surface for enterprise and air-gapped customers.
 
 **Required safeguards before any public release**:
 1. Ship `.deb`/`.rpm` as the primary Linux format; add a startup dependency check for raw binaries.
 2. Bundle the WebView2 offline bootstrapper on Windows.
-3. Run the full test suite against WebKit (Linux and macOS).
+3. Run the full test suite against WebKit (Linux and macOS) — BPMN/SVG rendering in particular.
 4. Publish installation guidance covering the system dependency, including offline/enterprise scenarios.
+5. Achieve parity with the existing Mocha test suite for all rewritten subsystems.
 
 **Suggested incremental path**:
-1. **Phase 1** — Ship core modeler with Tauri shell + the safeguards above. Bundle size win immediate.
-2. **Phase 2** — Port Zeebe connectivity to REST API. Unblocks the majority of workflow features.
-3. **Phase 3** — Redesign plugin system for Tauri's security model.
-4. **Phase 4** — Replace Electron-specific CI/CD (signing, publishing, auto-update).
+1. **Phase 1** — Ship core modeler (file open/save, local use) in a Tauri shell. The `zeebe-api/` and `file-context/` subsystems stay as JS running in a Node.js sidecar temporarily, preserving those features while the Rust rewrites are in progress. Bundle size win is partial but immediate.
+2. **Phase 2** — Port Zeebe connectivity to REST API in Rust. Retire the Node.js sidecar.
+3. **Phase 3** — Port `file-context/` watcher and BPMN/DMN indexer to Rust.
+4. **Phase 4** — Redesign plugin system for Tauri's security model.
+5. **Phase 5** — Replace Electron-specific CI/CD (signing, publishing, auto-update).
 
 ---
 
@@ -172,5 +241,6 @@ A full Tauri migration is feasible and the 7× bundle size reduction is a real, 
 - [Tauri bundle measurements](knowledge/03-tauri-bundle-measurements.md)
 - [Migration architecture](knowledge/04-migration-architecture.md)
 - [Migration blockers + distribution risks](knowledge/05-migration-blockers.md)
+- [JS codebase impact](knowledge/06-js-codebase-impact.md)
 - Worktree: `~/camunda/projects/bpmn.io/.other/experiments-repositories/tauri-migration/`
 - Branch: `experiment/tauri-migration` on `camunda-modeler`
