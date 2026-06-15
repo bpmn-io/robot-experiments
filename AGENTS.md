@@ -41,6 +41,7 @@ CUSTOMIZATION.TEMPLATE.md  # Template for the above
 
 When the user signals completion:
 
+0. Propose to user how to make the experiment publicly available - push changes to feature branches in selected repositories / create draft pull requests?
 1. Write `logs/<experiment-name>/SUMMARY.md` — executive summary, key findings, links to collateral.
 2. Promote any broadly useful learnings from `logs/<experiment-name>/knowledge/` to `knowledge/`.
 3. Run any "experiment completion" hooks defined in `CUSTOMIZATION.md`.
