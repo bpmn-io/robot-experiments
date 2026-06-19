@@ -1,0 +1,16 @@
+{
+  "skillOverrides": {
+    "code-review": "on",
+    "security-review": "on",
+    "simplify": "on",
+    "verify": "on",
+    "prd-before-code": "on",
+    "anthropic-skills:docx": "off",
+    "anthropic-skills:pdf": "off",
+    "anthropic-skills:pptx": "off",
+    "anthropic-skills:xlsx": "off",
+    "anthropic-skills:generate-deck": "off",
+    "anthropic-skills:customer-success-toolkit": "off",
+    "anthropic-skills:setup-cowork": "off"
+  }
+}
